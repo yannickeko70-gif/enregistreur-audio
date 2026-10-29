@@ -2,40 +2,57 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d12">
   <title>Enregistreur audio</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style/style.css">
 </head>
 <body>
-  <main>
-    <h1>Enregistreur audio</h1>
-    <div id="timer">00:00</div>
-    <div class="tabs">
-      <button id="tabAmp" class="tab active">Amplitude</button>
-      <button id="tabSpec" class="tab">Spectrogramme</button>
-    </div>
-    <canvas id="wave"></canvas>
+  <div class="app">
+    <header class="topbar">
+      <h1>Enregistreur</h1>
+      <span id="status" class="status" hidden>
+        <i class="dot"></i><span id="statusText"></span>
+      </span>
+    </header>
 
-    <p id="message" hidden></p>
+    <section class="stage">
+      <div class="tabs">
+        <button id="tabAmp" class="tab active">Amplitude</button>
+        <button id="tabSpec" class="tab">Spectrogramme</button>
+      </div>
 
-    <div class="controls">
-      <button id="btnStart">Démarrer</button>
-      <button id="btnPause" hidden>Pause</button>
-      <button id="btnStop" class="danger" hidden>Arrêter</button>
-    </div>
+      <div class="viz">
+        <canvas id="wave"></canvas>
+      </div>
 
-    <section id="playback" hidden>
-      <h2 id="playTitle"></h2>
-      <canvas id="playWave"></canvas>
-      <audio id="player" controls></audio>
+      <div id="timer" class="timer idle">00:00</div>
+
+      <p id="message" class="message" role="alert" hidden></p>
+
+      <div class="controls">
+        <div class="slot">
+          <button id="btnPause" class="round small" hidden></button>
+        </div>
+        <button id="btnMain" class="round big"></button>
+        <div class="slot"></div>
+      </div>
     </section>
 
-    <section>
-      <h2>Enregistrements</h2>
-      <ul id="list"></ul>
-      <p id="empty">Aucun enregistrement pour le moment.</p>
+    <section class="library">
+      <div class="library-head">
+        <h2>Enregistrements</h2>
+        <span id="count" class="count"></span>
+      </div>
+      <ul id="list" class="list"></ul>
+      <div id="empty" class="empty">
+        <div id="emptyIcon" class="empty-icon"></div>
+        <p>Aucun enregistrement</p>
+        <span>Appuie sur le bouton rouge pour commencer.</span>
+      </div>
     </section>
-  </main>
-  <script src="app.js"></script>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
 </body>
 </html>
