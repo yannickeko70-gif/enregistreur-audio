@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1115" />
+  <title>Enregistreur audio</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app">
+    <h1>Enregistreur audio</h1>
+
+    <div id="timer" class="timer">00:00</div>
+    <canvas id="visualizer"></canvas>
+    <p id="message" class="message" hidden></p>
+
+    <div class="controls">
+      <button id="btn-start" type="button">Démarrer</button>
+      <button id="btn-pause" type="button" hidden>Pause</button>
+      <button id="btn-stop" type="button" class="danger" hidden>Arrêter</button>
+    </div>
+
+    <section class="recordings">
+      <h2>Enregistrements</h2>
+      <p id="empty" class="empty">Aucun enregistrement pour le moment.</p>
+      <ul id="list"></ul>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
