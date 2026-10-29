@@ -1,237 +1,419 @@
-// ---------- Réglages ----------
-const MAX_POINTS = 80;        // taille fixe du tampon affiché
-const MIN_DB = -60;           // en dessous = silence
-const SAMPLE_INTERVAL = 50;   // un point toutes les 50 ms (~20/s)
+const MAX_POINTS = 60;        // barres du graphique en direct
+const PEAKS_COUNT = 80;       // barres du graphique de lecture
+const MIN_DB = -60;           // en dessous : silence
+const SAMPLE_EVERY_MS = 50;   // ~20 mesures par seconde
 
-// ---------- Éléments de la page ----------
 const $ = (id) => document.getElementById(id);
-const canvas = $('visualizer');
-const g = canvas.getContext('2d');
-const timerEl = $('timer');
-const messageEl = $('message');
-const btnStart = $('btn-start');
-const btnPause = $('btn-pause');
-const btnStop = $('btn-stop');
-const listEl = $('list');
-const emptyEl = $('empty');
+const timerEl = $("timer");
+const canvas = $("wave");
+const msgEl = $("message");
+const btnStart = $("btnStart");
+const btnPause = $("btnPause");
+const btnStop = $("btnStop");
+const player = $("player");
+const playSection = $("playback");
+const playTitle = $("playTitle");
+const playCanvas = $("playWave");
+const listEl = $("list");
+const emptyEl = $("empty");
+const g = canvas.getContext("2d");
+const pg = playCanvas.getContext("2d");
 
-// ---------- État ----------
-let audioCtx, analyser, stream, mediaRecorder, timeBuf;
+let stream, audioCtx, analyser, recorder, buf;
 let chunks = [];
 let levels = new Array(MAX_POINTS).fill(0);
-let state = 'idle'; // idle | recording | paused
+let allLevels = [];            // tout le niveau sonore de la session
+let state = "idle";            // idle | recording | paused
 let rafId = null;
+let playRaf = null;
 let lastSample = 0;
 let startedAt = 0;
-let elapsedBefore = 0;
+let accumulated = 0;
 let lastDuration = 0;
-let count = 0;
-let cssW = 0;
-let cssH = 0;
+let liveSize = { w: 0, h: 0 };
+let playSize = { w: 0, h: 0 };
+let current = null;            // enregistrement affiché dans le lecteur
+let currentUrl = null;
 
-// ---------- Utilitaires ----------
-function dbToLevel(db) {
-  const clamped = Math.max(MIN_DB, Math.min(0, db));
-  return (clamped - MIN_DB) / -MIN_DB; // 0 (silence) -> 1 (max)
+/* ---------- Utilitaires ---------- */
+
+function pad(n) {
+  return String(n).padStart(2, "0");
 }
 
 function formatTime(ms) {
   const total = Math.floor(ms / 1000);
-  const m = String(Math.floor(total / 60)).padStart(2, '0');
-  const s = String(total % 60).padStart(2, '0');
-  return `${m}:${s}`;
+  return pad(Math.floor(total / 60)) + ":" + pad(total % 60);
 }
 
-function getElapsed() {
-  return elapsedBefore + (state === 'recording' ? performance.now() - startedAt : 0);
+function formatDate(ts) {
+  return new Date(ts).toLocaleString("fr-FR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
-function chooseMimeType() {
-  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
-  if (!window.MediaRecorder) return '';
-  return types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+function elapsed() {
+  return state === "recording"
+    ? accumulated + (performance.now() - startedAt)
+    : accumulated;
 }
 
 function showMessage(text) {
-  messageEl.textContent = text;
-  messageEl.hidden = !text;
+  msgEl.textContent = text;
+  msgEl.hidden = false;
 }
 
-// ---------- Calcul du niveau (RMS puis dB) ----------
-function currentLevel() {
-  analyser.getByteTimeDomainData(timeBuf); // valeurs 0..255, silence = 128
-  let sum = 0;
-  for (let i = 0; i < timeBuf.length; i++) {
-    const v = (timeBuf[i] - 128) / 128;    // -1 .. +1
-    sum += v * v;
+function hideMessage() {
+  msgEl.hidden = true;
+}
+
+function updateUI() {
+  btnStart.hidden = state !== "idle";
+  btnPause.hidden = state === "idle";
+  btnStop.hidden = state === "idle";
+  btnPause.textContent = state === "paused" ? "Reprendre" : "Pause";
+}
+
+// Réduit un long tableau de niveaux à "count" barres (le maximum de chaque tranche)
+function toPeaks(all, count) {
+  if (!all.length) return new Array(count).fill(0);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const a = Math.floor((i * all.length) / count);
+    const b = Math.max(a + 1, Math.floor(((i + 1) * all.length) / count));
+    let m = 0;
+    for (let j = a; j < b && j < all.length; j++) m = Math.max(m, all[j]);
+    out.push(m);
   }
-  const rms = Math.sqrt(sum / timeBuf.length);
-  const db = rms > 0 ? 20 * Math.log10(rms) : MIN_DB;
-  return dbToLevel(db);
+  return out;
 }
 
-// ---------- Dessin ----------
-function resizeCanvas() {
+/* ---------- Stockage (IndexedDB) ---------- */
+
+let dbPromise = null;
+
+function openDB() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open("enregistreur-audio", 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore("recordings", {
+          keyPath: "id",
+          autoIncrement: true,
+        });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return dbPromise;
+}
+
+async function dbRun(mode, fn) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("recordings", mode);
+    const req = fn(tx.objectStore("recordings"));
+    tx.oncomplete = () => resolve(req.result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+const saveRecording = (rec) => dbRun("readwrite", (s) => s.add(rec));
+const getAllRecordings = () => dbRun("readonly", (s) => s.getAll());
+const removeRecording = (id) => dbRun("readwrite", (s) => s.delete(id));
+
+/* ---------- Dessin ---------- */
+
+function fitCanvas(c, ctx) {
   const dpr = window.devicePixelRatio || 1;
-  const r = canvas.getBoundingClientRect();
-  cssW = r.width;
-  cssH = r.height;
-  canvas.width = cssW * dpr;
-  canvas.height = cssH * dpr;
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  draw();
+  const r = c.getBoundingClientRect();
+  c.width = r.width * dpr;
+  c.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: r.width, h: r.height };
 }
 
-function draw() {
-  g.clearRect(0, 0, cssW, cssH);
-  const slot = cssW / MAX_POINTS;
+// progress : 0 -> 1, part des barres colorée en bleu (1 = tout en bleu)
+function drawBars(ctx, w, h, values, progress) {
+  ctx.clearRect(0, 0, w, h);
+  const slot = w / values.length;
   const barW = Math.max(2, slot * 0.6);
-  g.fillStyle = '#4f9cff';
-  for (let i = 0; i < levels.length; i++) {
-    const h = Math.max(2, levels[i] * cssH);
+  const played = progress * values.length;
+  values.forEach((v, i) => {
+    const bh = Math.max(3, v * h);
     const x = i * slot + (slot - barW) / 2;
-    g.fillRect(x, (cssH - h) / 2, barW, h); // barre centrée verticalement
-  }
+    const y = (h - bh) / 2;
+    ctx.fillStyle = i < played ? "#4f9cff" : "#3a4358";
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, barW, bh, barW / 2);
+    else ctx.rect(x, y, barW, bh);
+    ctx.fill();
+  });
 }
 
-function loop(ts) {
-  if (state === 'recording' && ts - lastSample >= SAMPLE_INTERVAL) {
-    lastSample = ts;
-    levels.push(currentLevel());
+function drawLive() {
+  drawBars(g, liveSize.w, liveSize.h, levels, 1);
+}
+
+function drawPlayback() {
+  if (!current) return;
+  const total = current.duration / 1000;
+  let ratio = total > 0 ? Math.min(1, player.currentTime / total) : 0;
+  if (player.ended) ratio = 1;
+  drawBars(pg, playSize.w, playSize.h, current.peaks, ratio);
+}
+
+/* ---------- Mesure du niveau sonore ---------- */
+
+function measureLevel() {
+  analyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+  const rms = Math.sqrt(sum / buf.length);
+  const db = 20 * Math.log10(rms || 1e-8);
+  return Math.min(1, Math.max(0, (db - MIN_DB) / -MIN_DB));
+}
+
+function loop(now) {
+  if (state === "recording" && now - lastSample >= SAMPLE_EVERY_MS) {
+    lastSample = now;
+    const lvl = measureLevel();
+    levels.push(lvl);
     levels.shift();
+    allLevels.push(lvl);
   }
-  timerEl.textContent = formatTime(getElapsed());
-  draw();
+  timerEl.textContent = formatTime(elapsed());
+  drawLive();
   rafId = requestAnimationFrame(loop);
 }
 
-// ---------- Interface ----------
-function updateButtons() {
-  btnStart.hidden = state !== 'idle';
-  btnPause.hidden = state === 'idle';
-  btnStop.hidden = state === 'idle';
-  btnPause.textContent = state === 'paused' ? 'Reprendre' : 'Pause';
-}
+/* ---------- Enregistrement ---------- */
 
-// ---------- Actions ----------
 async function start() {
-  showMessage('');
+  hideMessage();
+  player.pause(); // évite d'enregistrer la lecture en cours
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showMessage('Micro indisponible : la page doit être ouverte en HTTPS (ou sur localhost).');
-    return;
-  }
-  if (!window.MediaRecorder) {
-    showMessage("Ce navigateur ne supporte pas l'enregistrement audio.");
+    showMessage("Micro indisponible : ouvre la page en HTTPS.");
     return;
   }
 
   try {
-    // On coupe les traitements automatiques pour que l'amplitude reflète le vrai signal
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (err) {
-    if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
-      showMessage("Accès au micro refusé. Autorise le micro dans les réglages du navigateur, puis recharge la page.");
-    } else if (err.name === 'NotFoundError') {
-      showMessage('Aucun micro détecté sur cet appareil.');
+    if (err.name === "NotAllowedError") {
+      showMessage("Accès au micro refusé. Autorise-le dans les réglages du navigateur, puis réessaie.");
     } else {
-      showMessage(`Erreur micro : ${err.message}`);
+      showMessage("Impossible d'accéder au micro : " + err.message);
     }
     return;
   }
 
-  // Web Audio : le flux du micro passe dans un AnalyserNode
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   await audioCtx.resume();
+  const source = audioCtx.createMediaStreamSource(stream);
   analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 2048;
-  timeBuf = new Uint8Array(analyser.fftSize);
-  // Surtout ne pas connecter à audioCtx.destination (sinon larsen)
-  audioCtx.createMediaStreamSource(stream).connect(analyser);
+  analyser.fftSize = 1024;
+  buf = new Float32Array(analyser.fftSize);
+  source.connect(analyser);
 
-  // MediaRecorder : l'enregistrement du fichier
-  const mime = chooseMimeType();
-  mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
   chunks = [];
-  mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-  mediaRecorder.onstop = saveRecording;
-  mediaRecorder.start(250);
+  allLevels = [];
+  const rec = new MediaRecorder(stream);
+  recorder = rec;
+  rec.ondataavailable = (e) => {
+    if (e.data.size) chunks.push(e.data);
+  };
+  rec.onstop = () => finishRecording(rec.mimeType);
+  rec.start();
 
   levels = new Array(MAX_POINTS).fill(0);
-  elapsedBefore = 0;
+  accumulated = 0;
   startedAt = performance.now();
-  state = 'recording';
-  updateButtons();
+  state = "recording";
+  updateUI();
   rafId = requestAnimationFrame(loop);
 }
 
 function togglePause() {
-  if (state === 'recording') {
-    mediaRecorder.pause();
-    elapsedBefore += performance.now() - startedAt;
-    state = 'paused';
-  } else if (state === 'paused') {
-    mediaRecorder.resume();
+  if (state === "recording") {
+    recorder.pause();
+    accumulated = elapsed();
+    state = "paused";
+  } else if (state === "paused") {
+    recorder.resume();
     startedAt = performance.now();
-    state = 'recording';
+    state = "recording";
   }
-  updateButtons();
+  updateUI();
 }
 
 function stop() {
-  lastDuration = getElapsed();
-  state = 'idle';
-  cancelAnimationFrame(rafId);
-  mediaRecorder.stop();                      // déclenche saveRecording
-  stream.getTracks().forEach((t) => t.stop()); // libère le micro
+  accumulated = elapsed();
+  lastDuration = accumulated;
+  state = "idle";
+  recorder.stop();
+  stream.getTracks().forEach((t) => t.stop());
   audioCtx.close();
-  levels = new Array(MAX_POINTS).fill(0);
-  timerEl.textContent = '00:00';
-  draw();
-  updateButtons();
+  cancelAnimationFrame(rafId);
+  timerEl.textContent = formatTime(lastDuration);
+  updateUI();
 }
 
-function saveRecording() {
-  const type = mediaRecorder.mimeType || 'audio/webm';
-  const blob = new Blob(chunks, { type });
-  const url = URL.createObjectURL(blob);
-  const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
-  count += 1;
-  addToList(`Enregistrement ${count}`, url, lastDuration, ext);
+async function finishRecording(mimeType) {
+  const d = new Date();
+  const rec = {
+    name:
+      "Enregistrement " +
+      pad(d.getDate()) + "-" + pad(d.getMonth() + 1) + " " +
+      pad(d.getHours()) + "h" + pad(d.getMinutes()),
+    date: Date.now(),
+    duration: lastDuration,
+    mimeType: mimeType,
+    blob: new Blob(chunks, { type: mimeType }),
+    peaks: toPeaks(allLevels, PEAKS_COUNT),
+  };
+
+  try {
+    rec.id = await saveRecording(rec);
+  } catch (err) {
+    showMessage("Enregistrement non sauvegardé (stockage indisponible).");
+  }
+
+  openRecording(rec, false);
+  await renderList();
 }
 
-function addToList(name, url, duration, ext) {
-  emptyEl.hidden = true;
+/* ---------- Lecture ---------- */
 
-  const li = document.createElement('li');
-
-  const head = document.createElement('div');
-  head.className = 'rec-head';
-  const title = document.createElement('span');
-  title.textContent = name;
-  const dur = document.createElement('span');
-  dur.textContent = formatTime(duration);
-  head.append(title, dur);
-
-  const audio = document.createElement('audio');
-  audio.controls = true;
-  audio.src = url;
-
-  const link = document.createElement('a');
-  link.className = 'dl';
-  link.href = url;
-  link.download = `${name.toLowerCase().replace(/\s+/g, '-')}.${ext}`;
-  link.textContent = 'Télécharger';
-
-  li.append(head, audio, link);
-  listEl.prepend(li); // le plus récent en haut
+function openRecording(rec, autoplay) {
+  if (currentUrl) URL.revokeObjectURL(currentUrl);
+  current = rec;
+  currentUrl = URL.createObjectURL(rec.blob);
+  player.src = currentUrl;
+  playTitle.textContent = rec.name;
+  playSection.hidden = false;
+  playSize = fitCanvas(playCanvas, pg);
+  drawPlayback();
+  if (autoplay) player.play().catch(() => {});
 }
 
-// ---------- Démarrage ----------
-btnStart.addEventListener('click', start);
-btnPause.addEventListener('click', togglePause);
-btnStop.addEventListener('click', stop);
-window.addEventListener('resize', resizeCanvas);
-resizeCanvas();
+function playLoop() {
+  drawPlayback();
+  if (!player.paused && !player.ended) {
+    playRaf = requestAnimationFrame(playLoop);
+  }
+}
+
+player.addEventListener("play", () => {
+  cancelAnimationFrame(playRaf);
+  playLoop();
+});
+["pause", "ended", "seeked", "timeupdate"].forEach((ev) =>
+  player.addEventListener(ev, drawPlayback)
+);
+
+function download(rec) {
+  const ext = rec.mimeType.includes("mp4")
+    ? "m4a"
+    : rec.mimeType.includes("ogg")
+    ? "ogg"
+    : "webm";
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(rec.blob);
+  a.download = rec.name + "." + ext;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+async function deleteRecording(rec) {
+  if (!window.confirm("Supprimer cet enregistrement ?")) return;
+  try {
+    await removeRecording(rec.id);
+  } catch (err) {
+    showMessage("Suppression impossible.");
+    return;
+  }
+  if (current && current.id === rec.id) {
+    player.pause();
+    player.removeAttribute("src");
+    player.load();
+    playSection.hidden = true;
+    current = null;
+  }
+  await renderList();
+}
+
+/* ---------- Liste ---------- */
+
+function makeButton(label, onClick, ghost) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  if (ghost) b.className = "ghost";
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+async function renderList() {
+  let items = [];
+  try {
+    items = await getAllRecordings();
+  } catch (err) {
+    showMessage("Stockage indisponible : la liste ne peut pas s'afficher.");
+  }
+  items.sort((a, b) => b.id - a.id);
+
+  listEl.innerHTML = "";
+  emptyEl.hidden = items.length > 0;
+
+  items.forEach((rec) => {
+    const li = document.createElement("li");
+    if (current && current.id === rec.id) li.classList.add("active");
+
+    const info = document.createElement("div");
+    info.className = "info";
+    const name = document.createElement("strong");
+    name.textContent = rec.name;
+    const meta = document.createElement("span");
+    meta.textContent = formatDate(rec.date) + " · " + formatTime(rec.duration);
+    info.append(name, meta);
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.append(
+      makeButton("Lire", () => {
+        openRecording(rec, true);
+        renderList();
+      }),
+      makeButton("↓", () => download(rec), true),
+      makeButton("✕", () => deleteRecording(rec), true)
+    );
+
+    li.append(info, actions);
+    listEl.append(li);
+  });
+}
+
+/* ---------- Démarrage ---------- */
+
+btnStart.addEventListener("click", start);
+btnPause.addEventListener("click", togglePause);
+btnStop.addEventListener("click", stop);
+
+window.addEventListener("resize", () => {
+  liveSize = fitCanvas(canvas, g);
+  drawLive();
+  if (!playSection.hidden) {
+    playSize = fitCanvas(playCanvas, pg);
+    drawPlayback();
+  }
+});
+
+liveSize = fitCanvas(canvas, g);
+drawLive();
+updateUI();
+renderList();
