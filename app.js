@@ -2,6 +2,10 @@ const MAX_POINTS = 60;        // barres du graphique en direct
 const PEAKS_COUNT = 80;       // barres du graphique de lecture
 const MIN_DB = -60;           // en dessous : silence
 const SAMPLE_EVERY_MS = 50;   // ~20 mesures par seconde
+const SPEC_COLS = 240;        // colonnes de temps conservées
+const SPEC_ROWS = 128;        // lignes de fréquence
+const SPEC_EVERY_MS = 30;     // ~33 colonnes par seconde
+const MAX_FREQ = 8000;        // la voix se situe surtout sous 8 kHz
 
 const $ = (id) => document.getElementById(id);
 const timerEl = $("timer");
@@ -17,7 +21,8 @@ const playCanvas = $("playWave");
 const listEl = $("list");
 const emptyEl = $("empty");
 const g = canvas.getContext("2d");
-const pg = playCanvas.getContext("2d");
+const tabAmp = $("tabAmp");
+const tabSpec = $("tabSpec");
 
 let stream, audioCtx, analyser, recorder, buf;
 let chunks = [];
@@ -33,7 +38,16 @@ let lastDuration = 0;
 let liveSize = { w: 0, h: 0 };
 let playSize = { w: 0, h: 0 };
 let current = null;            // enregistrement affiché dans le lecteur
-let currentUrl = null;
+
+let freqData;
+let lastSpec = 0;
+let viewMode = "amplitude";    // amplitude | spectrogram
+
+// Image du spectrogramme, hors écran, copiée ensuite sur le canvas visible
+const specCanvas = document.createElement("canvas");
+specCanvas.width = SPEC_COLS;
+specCanvas.height = SPEC_ROWS;
+const specCtx = specCanvas.getContext("2d");
 
 /* ---------- Utilitaires ---------- */
 
@@ -126,6 +140,38 @@ const saveRecording = (rec) => dbRun("readwrite", (s) => s.add(rec));
 const getAllRecordings = () => dbRun("readonly", (s) => s.getAll());
 const removeRecording = (id) => dbRun("readwrite", (s) => s.delete(id));
 
+/* ---------- Couleurs du spectrogramme ---------- */
+
+const STOPS = [
+  [0,    [10, 12, 20]],
+  [0.25, [60, 20, 120]],
+  [0.5,  [200, 40, 100]],
+  [0.75, [250, 150, 40]],
+  [1,    [255, 250, 200]],
+];
+
+// Tableau de 256 couleurs : valeur 0 (silence) -> 255 (très fort)
+function buildPalette() {
+  const lut = [];
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 1;
+    while (k < STOPS.length - 1 && t > STOPS[k][0]) k++;
+    const [t0, c0] = STOPS[k - 1];
+    const [t1, c1] = STOPS[k];
+    const f = (t - t0) / (t1 - t0);
+    lut.push(c0.map((v, j) => Math.round(v + (c1[j] - v) * f)));
+  }
+  return lut;
+}
+const PALETTE = buildPalette();
+
+function resetSpectrogram() {
+  const [R, G, B] = PALETTE[0];
+  specCtx.fillStyle = "rgb(" + R + "," + G + "," + B + ")";
+  specCtx.fillRect(0, 0, SPEC_COLS, SPEC_ROWS);
+}
+
 /* ---------- Dessin ---------- */
 
 function fitCanvas(c, ctx) {
@@ -156,7 +202,16 @@ function drawBars(ctx, w, h, values, progress) {
 }
 
 function drawLive() {
-  drawBars(g, liveSize.w, liveSize.h, levels, 1);
+  if (viewMode === "spectrogram") {
+    g.drawImage(specCanvas, 0, 0, SPEC_COLS, SPEC_ROWS, 0, 0, liveSize.w, liveSize.h);
+    g.fillStyle = "#fff";
+    g.font = "11px system-ui, sans-serif";
+    g.fillText("8 kHz", 6, 14);
+    g.fillText("4 kHz", 6, liveSize.h / 2);
+    g.fillText("0 Hz", 6, liveSize.h - 6);
+  } else {
+    drawBars(g, liveSize.w, liveSize.h, levels, 1);
+  }
 }
 
 function drawPlayback() {
@@ -178,6 +233,31 @@ function measureLevel() {
   return Math.min(1, Math.max(0, (db - MIN_DB) / -MIN_DB));
 }
 
+// Ajoute une colonne de couleurs à droite du spectrogramme, qui défile vers la gauche
+function pushSpectrum() {
+  analyser.getByteFrequencyData(freqData);  // intensité 0-255 de chaque fréquence
+  const hzPerBin = audioCtx.sampleRate / analyser.fftSize;
+  const maxBin = Math.min(freqData.length - 1, Math.floor(MAX_FREQ / hzPerBin));
+  const step = maxBin / SPEC_ROWS;
+  const col = specCtx.createImageData(1, SPEC_ROWS);
+
+  for (let r = 0; r < SPEC_ROWS; r++) {
+    const a = Math.floor(r * step);
+    const b = Math.max(a + 1, Math.floor((r + 1) * step));
+    let v = 0;
+    for (let k = a; k < b; k++) v = Math.max(v, freqData[k]);
+    const [R, G, B] = PALETTE[v];
+    const o = (SPEC_ROWS - 1 - r) * 4;      // basses fréquences en bas
+    col.data[o] = R;
+    col.data[o + 1] = G;
+    col.data[o + 2] = B;
+    col.data[o + 3] = 255;
+  }
+
+  specCtx.drawImage(specCanvas, -1, 0);                // décale d'un pixel à gauche
+  specCtx.putImageData(col, SPEC_COLS - 1, 0);         // nouvelle colonne à droite
+}
+
 function loop(now) {
   if (state === "recording" && now - lastSample >= SAMPLE_EVERY_MS) {
     lastSample = now;
@@ -185,6 +265,10 @@ function loop(now) {
     levels.push(lvl);
     levels.shift();
     allLevels.push(lvl);
+  }
+  if (state === "recording" && now - lastSpec >= SPEC_EVERY_MS) {
+    lastSpec = now;
+    pushSpectrum();
   }
   timerEl.textContent = formatTime(elapsed());
   drawLive();
@@ -216,10 +300,15 @@ async function start() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   await audioCtx.resume();
   const source = audioCtx.createMediaStreamSource(stream);
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 1024;
+    analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.6;
+  analyser.minDecibels = -90;
+  analyser.maxDecibels = -25;
   buf = new Float32Array(analyser.fftSize);
+  freqData = new Uint8Array(analyser.frequencyBinCount);
   source.connect(analyser);
+  resetSpectrogram();
 
   chunks = [];
   allLevels = [];
@@ -412,6 +501,16 @@ window.addEventListener("resize", () => {
     drawPlayback();
   }
 });
+
+function setView(mode) {
+  viewMode = mode;
+  tabAmp.classList.toggle("active", mode === "amplitude");
+  tabSpec.classList.toggle("active", mode === "spectrogram");
+  drawLive();
+}
+tabAmp.addEventListener("click", () => setView("amplitude"));
+tabSpec.addEventListener("click", () => setView("spectrogram"));
+resetSpectrogram();
 
 liveSize = fitCanvas(canvas, g);
 drawLive();

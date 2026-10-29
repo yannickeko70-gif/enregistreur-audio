@@ -116,3 +116,6 @@ li button { padding: 8px 12px; font-size: 14px; }
 button.ghost { background: #2a2f3a; }
 
 #empty { color: #8a8f98; margin: 0; }
+.tabs { display: flex; gap: 8px; }
+.tab { background: #2a2f3a; padding: 8px 14px; font-size: 14px; }
+.tab.active { background: #4f9cff; }
