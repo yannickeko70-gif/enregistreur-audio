@@ -53,3 +53,8 @@ window.addEventListener("resize", () => {
 initVisualizer();
 updateControls("idle");
 initLibrary();
+
+// Mode installable : mise en cache de l'application
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
